@@ -1,0 +1,68 @@
+const express = require("express");
+const upload = require("../middleware/uploadMiddleware");
+
+const {
+  uploadFile,
+  getFiles,
+  getFileUrl,
+  renameFile,
+  deleteFile,
+  getTrash,
+  restoreFile,
+} = require("../controllers/fileController");
+
+const authMiddleware = require("../middleware/authMiddleware");
+
+const router = express.Router();
+
+// Upload a file
+router.post(
+  "/upload",
+  authMiddleware,
+  upload.single("file"),
+  uploadFile
+);
+
+// Get user's active files
+router.get(
+  "/",
+  authMiddleware,
+  getFiles
+);
+
+// Get trash
+router.get(
+  "/trash",
+  authMiddleware,
+  getTrash
+);
+
+// Restore file from trash
+router.put(
+  "/:id/restore",
+  authMiddleware,
+  restoreFile
+);
+
+// Get download URL
+router.get(
+  "/:id/url",
+  authMiddleware,
+  getFileUrl
+);
+
+// Rename file
+router.put(
+  "/:id",
+  authMiddleware,
+  renameFile
+);
+
+// Move file to trash
+router.delete(
+  "/:id",
+  authMiddleware,
+  deleteFile
+);
+
+module.exports = router;
