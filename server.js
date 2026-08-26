@@ -17,13 +17,13 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// Session middleware (needed for Google OAuth)
+// Session middleware
 app.use(
   session({
     secret: process.env.JWT_SECRET,
     resave: false,
     saveUninitialized: false,
-  }),
+  })
 );
 
 // Initialize Passport
@@ -55,12 +55,18 @@ app.get("/api/profile", authMiddleware, (req, res) => {
   });
 });
 
-// Test database connection
-pool
-  .query("SELECT NOW()")
-  .then(() => console.log("Supabase PostgreSQL Connected Successfully"))
-  .catch((err) => console.error("Database Connection Error:", err.message));
+// Test database connection only when not running tests
+if (process.env.NODE_ENV !== "test") {
+  pool
+    .query("SELECT NOW()")
+    .then(() => console.log("Supabase PostgreSQL Connected Successfully"))
+    .catch((err) =>
+      console.error("Database Connection Error:", err.message)
+    );
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
