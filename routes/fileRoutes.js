@@ -1,4 +1,5 @@
 const express = require("express");
+
 const upload = require("../middleware/uploadMiddleware");
 
 const {
@@ -9,6 +10,7 @@ const {
   deleteFile,
   getTrash,
   restoreFile,
+  searchFiles,
 } = require("../controllers/fileController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -21,6 +23,13 @@ router.post(
   authMiddleware,
   upload.single("file"),
   uploadFile
+);
+
+// Search user's files
+router.get(
+  "/search",
+  authMiddleware,
+  searchFiles
 );
 
 // Get user's active files

@@ -34,7 +34,7 @@ const uploadFile = async (req, res) => {
        (user_id, file_name, file_size, file_type, storage_path)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [userId, file.originalname, file.size, file.mimetype, fileName],
+      [userId, file.originalname, file.size, file.mimetype, fileName]
     );
 
     res.status(201).json({
@@ -51,23 +51,47 @@ const uploadFile = async (req, res) => {
   }
 };
 
-// Get user's files
+// Get user's files with pagination
 const getFiles = async (req, res) => {
   try {
     const userId = req.user.id;
+
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit) || 10, 1),
+      50
+    );
+
+    const offset = (page - 1) * limit;
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)
+       FROM files
+       WHERE user_id = $1
+       AND deleted_at IS NULL`,
+      [userId]
+    );
 
     const result = await pool.query(
       `SELECT *
        FROM files
        WHERE user_id = $1
        AND deleted_at IS NULL
-       ORDER BY created_at DESC`,
-      [userId],
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
     );
+
+    const total = parseInt(countResult.rows[0].count);
+    const totalPages = Math.ceil(total / limit);
 
     res.json({
       message: "Files fetched successfully",
       files: result.rows,
+      page,
+      limit,
+      total,
+      totalPages,
     });
   } catch (error) {
     console.error("Get Files Error:", error);
@@ -89,7 +113,7 @@ const getFileUrl = async (req, res) => {
       `SELECT *
        FROM files
        WHERE id = $1 AND user_id = $2`,
-      [id, userId],
+      [id, userId]
     );
 
     if (result.rows.length === 0) {
@@ -143,7 +167,7 @@ const renameFile = async (req, res) => {
        SET file_name = $1
        WHERE id = $2 AND user_id = $3
        RETURNING *`,
-      [file_name, id, userId],
+      [file_name, id, userId]
     );
 
     if (result.rows.length === 0) {
@@ -165,6 +189,7 @@ const renameFile = async (req, res) => {
     });
   }
 };
+
 // Soft delete file
 const deleteFile = async (req, res) => {
   try {
@@ -198,6 +223,7 @@ const deleteFile = async (req, res) => {
     });
   }
 };
+
 // Get trashed files
 const getTrash = async (req, res) => {
   try {
@@ -225,6 +251,7 @@ const getTrash = async (req, res) => {
     });
   }
 };
+
 // Restore file from trash
 const restoreFile = async (req, res) => {
   try {
@@ -258,6 +285,44 @@ const restoreFile = async (req, res) => {
     });
   }
 };
+
+// Search user's files
+const searchFiles = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { q } = req.query;
+
+    if (!q) {
+      return res.status(400).json({
+        message: "Search query is required",
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT *
+       FROM files
+       WHERE user_id = $1
+       AND deleted_at IS NULL
+       AND to_tsvector('english', file_name)
+           @@ plainto_tsquery('english', $2)
+       ORDER BY created_at DESC`,
+      [userId, q]
+    );
+
+    res.json({
+      message: "Search completed successfully",
+      files: result.rows,
+    });
+  } catch (error) {
+    console.error("Search Files Error:", error);
+
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
 module.exports = {
   uploadFile,
   getFiles,
@@ -266,4 +331,5 @@ module.exports = {
   deleteFile,
   getTrash,
   restoreFile,
+  searchFiles,
 };
