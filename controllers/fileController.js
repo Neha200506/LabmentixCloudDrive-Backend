@@ -28,13 +28,19 @@ const uploadFile = async (req, res) => {
     }
 
     const userId = req.user.id;
+    const { folder_id } = req.body;
+
+    let dbFolderId = null;
+    if (folder_id && folder_id !== 'null' && folder_id !== 'undefined') {
+      dbFolderId = folder_id;
+    }
 
     const result = await pool.query(
       `INSERT INTO files
-       (user_id, file_name, file_size, file_type, storage_path)
-       VALUES ($1, $2, $3, $4, $5)
+       (user_id, file_name, file_size, file_type, storage_path, folder_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [userId, file.originalname, file.size, file.mimetype, fileName]
+      [userId, file.originalname, file.size, file.mimetype, fileName, dbFolderId]
     );
 
     res.status(201).json({
@@ -55,32 +61,37 @@ const uploadFile = async (req, res) => {
 const getFiles = async (req, res) => {
   try {
     const userId = req.user.id;
+    const folderId = req.query.folder_id;
 
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(
       Math.max(parseInt(req.query.limit) || 10, 1),
-      50
+      1000
     );
 
     const offset = (page - 1) * limit;
 
-    const countResult = await pool.query(
-      `SELECT COUNT(*)
-       FROM files
-       WHERE user_id = $1
-       AND deleted_at IS NULL`,
-      [userId]
-    );
+    let countQueryText = `SELECT COUNT(*) FROM files WHERE user_id = $1 AND deleted_at IS NULL`;
+    let queryText = `SELECT * FROM files WHERE user_id = $1 AND deleted_at IS NULL`;
+    let countParams = [userId];
+    let queryParams = [userId, limit, offset];
 
-    const result = await pool.query(
-      `SELECT *
-       FROM files
-       WHERE user_id = $1
-       AND deleted_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
-    );
+    if (folderId) {
+      if (folderId === 'root' || folderId === 'null') {
+        countQueryText += ` AND folder_id IS NULL`;
+        queryText += ` AND folder_id IS NULL`;
+      } else {
+        countQueryText += ` AND folder_id = $2`;
+        countParams.push(folderId);
+        queryText += ` AND folder_id = $4`;
+        queryParams.push(folderId);
+      }
+    }
+
+    queryText += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+
+    const countResult = await pool.query(countQueryText, countParams);
+    const result = await pool.query(queryText, queryParams);
 
     const total = parseInt(countResult.rows[0].count);
     const totalPages = Math.ceil(total / limit);
@@ -258,19 +269,37 @@ const restoreFile = async (req, res) => {
     const { id } = req.params;
     const userId = req.user.id;
 
-    const result = await pool.query(
-      `UPDATE files
-       SET deleted_at = NULL
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
-       RETURNING *`,
+    const fileCheck = await pool.query(
+      `SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL`,
       [id, userId]
     );
 
-    if (result.rows.length === 0) {
+    if (fileCheck.rows.length === 0) {
       return res.status(404).json({
         message: "Trashed file not found",
       });
     }
+
+    const file = fileCheck.rows[0];
+    let targetFolderId = file.folder_id;
+
+    if (targetFolderId) {
+      const parentCheck = await pool.query(
+        `SELECT id, deleted_at FROM folders WHERE id = $1 AND user_id = $2`,
+        [targetFolderId, userId]
+      );
+      if (parentCheck.rows.length === 0 || parentCheck.rows[0].deleted_at !== null) {
+        targetFolderId = null;
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE files
+       SET deleted_at = NULL, folder_id = $1
+       WHERE id = $2 AND user_id = $3 AND deleted_at IS NOT NULL
+       RETURNING *`,
+      [targetFolderId, id, userId]
+    );
 
     res.json({
       message: "File restored successfully",
@@ -278,7 +307,6 @@ const restoreFile = async (req, res) => {
     });
   } catch (error) {
     console.error("Restore File Error:", error);
-
     res.status(500).json({
       message: "Server error",
       error: error.message,
@@ -323,6 +351,85 @@ const searchFiles = async (req, res) => {
   }
 };
 
+// Toggle star status of file
+const toggleStarFile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `UPDATE files
+       SET is_starred = NOT COALESCE(is_starred, false)
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       RETURNING *`,
+      [id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        message: "File not found",
+      });
+    }
+
+    res.json({
+      message: "File star toggled successfully",
+      file: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Toggle Star File Error:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// Permanent delete file
+const deleteFilePermanent = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      `SELECT * FROM files WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        message: "File not found",
+      });
+    }
+
+    const file = result.rows[0];
+
+    // Delete from Supabase Storage
+    const { error } = await supabase.storage
+      .from("files")
+      .remove([file.storage_path]);
+
+    if (error) {
+      console.warn("Storage deletion warning (might already be deleted):", error.message);
+    }
+
+    // Delete row from DB
+    await pool.query(
+      `DELETE FROM files WHERE id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    res.json({
+      message: "File permanently deleted successfully",
+    });
+  } catch (error) {
+    console.error("Permanent Delete File Error:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
 module.exports = {
   uploadFile,
   getFiles,
@@ -332,4 +439,6 @@ module.exports = {
   getTrash,
   restoreFile,
   searchFiles,
+  toggleStarFile,
+  deleteFilePermanent,
 };

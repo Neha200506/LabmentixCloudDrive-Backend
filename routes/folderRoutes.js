@@ -7,6 +7,8 @@ const {
   deleteFolder,
   getFolderTrash,
   restoreFolder,
+  toggleStarFolder,
+  deleteFolderPermanent,
 } = require("../controllers/folderController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -53,6 +55,20 @@ router.delete(
   "/:id",
   authMiddleware,
   deleteFolder
+);
+
+// Toggle star status of folder
+router.put(
+  "/:id/star",
+  authMiddleware,
+  toggleStarFolder
+);
+
+// Permanent delete folder
+router.delete(
+  "/:id/permanent",
+  authMiddleware,
+  deleteFolderPermanent
 );
 
 module.exports = router;

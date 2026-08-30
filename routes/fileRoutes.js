@@ -11,6 +11,8 @@ const {
   getTrash,
   restoreFile,
   searchFiles,
+  toggleStarFile,
+  deleteFilePermanent,
 } = require("../controllers/fileController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -72,6 +74,20 @@ router.delete(
   "/:id",
   authMiddleware,
   deleteFile
+);
+
+// Toggle star status of file
+router.put(
+  "/:id/star",
+  authMiddleware,
+  toggleStarFile
+);
+
+// Permanent delete file
+router.delete(
+  "/:id/permanent",
+  authMiddleware,
+  deleteFilePermanent
 );
 
 module.exports = router;
