@@ -71,24 +71,54 @@ const getFiles = async (req, res) => {
 
     const offset = (page - 1) * limit;
 
-    let countQueryText = `SELECT COUNT(*) FROM files WHERE user_id = $1 AND deleted_at IS NULL`;
-    let queryText = `SELECT * FROM files WHERE user_id = $1 AND deleted_at IS NULL`;
-    let countParams = [userId];
-    let queryParams = [userId, limit, offset];
+    let countQueryText;
+    let queryText;
+    let countParams;
+    let queryParams;
 
     if (folderId) {
+      countQueryText = `SELECT COUNT(*) FROM files WHERE user_id = $1 AND deleted_at IS NULL`;
+      queryText = `SELECT f.*, false AS is_shared, NULL AS shared_permission, u.full_name AS owner_name FROM files f LEFT JOIN users u ON f.user_id = u.id WHERE f.user_id = $1 AND f.deleted_at IS NULL`;
+      countParams = [userId];
+      queryParams = [userId, limit, offset];
+
       if (folderId === 'root' || folderId === 'null') {
         countQueryText += ` AND folder_id IS NULL`;
-        queryText += ` AND folder_id IS NULL`;
+        queryText += ` AND f.folder_id IS NULL`;
       } else {
         countQueryText += ` AND folder_id = $2`;
         countParams.push(folderId);
-        queryText += ` AND folder_id = $4`;
+        queryText += ` AND f.folder_id = $4`;
         queryParams.push(folderId);
       }
+    } else {
+      // General dashboard view: return owned files AND shared files
+      countQueryText = `
+        SELECT COUNT(DISTINCT f.id) 
+        FROM files f
+        LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $1
+        LEFT JOIN users u_me ON u_me.id = $1
+        LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u_me.email) || ':%'
+        WHERE (f.user_id = $1 OR p.shared_with = $1 OR fs.id IS NOT NULL) AND f.deleted_at IS NULL`;
+      
+      queryText = `
+        SELECT f.id, f.user_id, f.folder_id, f.file_name, f.file_size, f.file_type, f.storage_path, f.created_at, f.deleted_at, f.is_starred,
+               u.full_name AS owner_name,
+               CASE WHEN f.user_id = $1 THEN false ELSE true END AS is_shared,
+               COALESCE(p.permission_type, fs.role) AS shared_permission
+        FROM files f
+        LEFT JOIN users u ON f.user_id = u.id
+        LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $1
+        LEFT JOIN users u_me ON u_me.id = $1
+        LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u_me.email) || ':%'
+        WHERE (f.user_id = $1 OR p.shared_with = $1 OR fs.id IS NOT NULL) AND f.deleted_at IS NULL
+        GROUP BY f.id, f.user_id, f.folder_id, f.file_name, f.file_size, f.file_type, f.storage_path, f.created_at, f.deleted_at, f.is_starred, u.full_name, p.permission_type, fs.role`;
+        
+      countParams = [userId];
+      queryParams = [userId, limit, offset];
     }
 
-    queryText += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+    queryText += ` ORDER BY f.created_at DESC LIMIT $2 OFFSET $3`;
 
     const countResult = await pool.query(countQueryText, countParams);
     const result = await pool.query(queryText, queryParams);
@@ -121,9 +151,10 @@ const getFileUrl = async (req, res) => {
     const { id } = req.params;
 
     const result = await pool.query(
-      `SELECT *
-       FROM files
-       WHERE id = $1 AND user_id = $2`,
+      `SELECT f.*
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND (f.user_id = $2 OR p.shared_with = $2)`,
       [id, userId]
     );
 
@@ -173,19 +204,36 @@ const renameFile = async (req, res) => {
       });
     }
 
+    // Check if user is owner or has edit permission
+    const checkAccess = await pool.query(
+      `SELECT f.*, 
+              CASE WHEN f.user_id = $2 THEN 'owner' ELSE p.permission_type END AS perm
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND f.deleted_at IS NULL`,
+      [id, userId]
+    );
+
+    if (checkAccess.rows.length === 0) {
+      return res.status(404).json({
+        message: "File not found or access denied",
+      });
+    }
+
+    const permission = (checkAccess.rows[0].perm || "").toLowerCase();
+    if (permission !== 'owner' && permission !== 'edit' && permission !== 'editor') {
+      return res.status(403).json({
+        message: "You do not have permission to edit this file",
+      });
+    }
+
     const result = await pool.query(
       `UPDATE files
        SET file_name = $1
-       WHERE id = $2 AND user_id = $3
+       WHERE id = $2
        RETURNING *`,
-      [file_name, id, userId]
+      [file_name, id]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        message: "File not found",
-      });
-    }
 
     res.json({
       message: "File renamed successfully",
@@ -207,19 +255,35 @@ const deleteFile = async (req, res) => {
     const { id } = req.params;
     const userId = req.user.id;
 
-    const result = await pool.query(
-      `UPDATE files
-       SET deleted_at = NOW()
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-       RETURNING *`,
+    const checkAccess = await pool.query(
+      `SELECT f.*, 
+              CASE WHEN f.user_id = $2 THEN 'owner' ELSE p.permission_type END AS perm
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND f.deleted_at IS NULL`,
       [id, userId]
     );
 
-    if (result.rows.length === 0) {
+    if (checkAccess.rows.length === 0) {
       return res.status(404).json({
-        message: "File not found",
+        message: "File not found or access denied",
       });
     }
+
+    const permission = (checkAccess.rows[0].perm || "").toLowerCase();
+    if (permission !== 'owner' && permission !== 'edit' && permission !== 'editor') {
+      return res.status(403).json({
+        message: "You do not have permission to delete this file",
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE files
+       SET deleted_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
 
     res.json({
       message: "File moved to trash successfully",
@@ -390,18 +454,30 @@ const deleteFilePermanent = async (req, res) => {
     const { id } = req.params;
     const userId = req.user.id;
 
-    const result = await pool.query(
-      `SELECT * FROM files WHERE id = $1 AND user_id = $2`,
+    // Only file owner or Editor can permanently delete
+    const checkAccess = await pool.query(
+      `SELECT f.*, 
+              CASE WHEN f.user_id = $2 THEN 'owner' ELSE p.permission_type END AS perm
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1`,
       [id, userId]
     );
 
-    if (result.rows.length === 0) {
+    if (checkAccess.rows.length === 0) {
       return res.status(404).json({
-        message: "File not found",
+        message: "File not found or access denied",
       });
     }
 
-    const file = result.rows[0];
+    const permission = (checkAccess.rows[0].perm || "").toLowerCase();
+    if (permission !== 'owner' && permission !== 'edit' && permission !== 'editor') {
+      return res.status(403).json({
+        message: "You do not have permission to permanently delete this file",
+      });
+    }
+
+    const file = checkAccess.rows[0];
 
     // Delete from Supabase Storage
     const { error } = await supabase.storage
@@ -414,8 +490,8 @@ const deleteFilePermanent = async (req, res) => {
 
     // Delete row from DB
     await pool.query(
-      `DELETE FROM files WHERE id = $1 AND user_id = $2`,
-      [id, userId]
+      `DELETE FROM files WHERE id = $1`,
+      [id]
     );
 
     res.json({
@@ -423,6 +499,132 @@ const deleteFilePermanent = async (req, res) => {
     });
   } catch (error) {
     console.error("Permanent Delete File Error:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
+// Update file content
+const updateFileContent = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const { content } = req.body;
+
+    if (content === undefined || content === null) {
+      return res.status(400).json({
+        message: "Content is required",
+      });
+    }
+
+    // Check access: user must be owner or have edit permission
+    const checkAccess = await pool.query(
+      `SELECT f.*, 
+              CASE 
+                WHEN f.user_id = $2 THEN 'owner' 
+                ELSE COALESCE(p.permission_type, fs.role) 
+              END AS perm
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       LEFT JOIN users u ON u.id = $2
+       LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u.email) || ':%'
+       WHERE f.id = $1 AND f.deleted_at IS NULL`,
+      [id, userId]
+    );
+
+    if (checkAccess.rows.length === 0) {
+      return res.status(404).json({
+        message: "File not found or access denied",
+      });
+    }
+
+    const fileRecord = checkAccess.rows[0];
+    const permission = (fileRecord.perm || "").toLowerCase();
+
+    if (permission !== 'owner' && permission !== 'edit' && permission !== 'editor') {
+      return res.status(403).json({
+        message: "You do not have permission to edit this file",
+      });
+    }
+
+    let contentBuffer;
+    let contentType = fileRecord.file_type || 'text/plain';
+
+    if ((fileRecord.file_name && fileRecord.file_name.toLowerCase().endsWith('.pdf')) || fileRecord.file_type === 'application/pdf') {
+      contentType = 'application/pdf';
+      try {
+        const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
+        let pdfDoc;
+
+        const { data: existingData, error: downloadError } = await supabase.storage
+          .from("files")
+          .download(fileRecord.storage_path);
+
+        if (!downloadError && existingData) {
+          const existingBuffer = Buffer.from(await existingData.arrayBuffer());
+          pdfDoc = await PDFDocument.load(existingBuffer);
+        } else {
+          pdfDoc = await PDFDocument.create();
+        }
+
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const lines = (content || '').split('\n');
+
+        let page = pdfDoc.addPage([600, 800]);
+        page.drawText("--- Document Edit / Notes ---", { x: 50, y: 750, size: 12, font, color: rgb(0.2, 0.4, 0.8) });
+        let y = 720;
+
+        for (const line of lines) {
+          if (y < 40) {
+            page = pdfDoc.addPage([600, 800]);
+            y = 750;
+          }
+          const safeLine = line.replace(/[^\x00-\x7F]/g, '');
+          page.drawText(safeLine || ' ', { x: 50, y, size: 11, font, color: rgb(0.1, 0.1, 0.1) });
+          y -= 16;
+        }
+        const pdfBytes = await pdfDoc.save();
+        contentBuffer = Buffer.from(pdfBytes);
+      } catch (pdfErr) {
+        console.error("PDF compilation error, falling back to UTF-8 buffer:", pdfErr);
+        contentBuffer = Buffer.from(content, 'utf-8');
+      }
+    } else {
+      contentBuffer = Buffer.from(content, 'utf-8');
+    }
+
+    // Upload/upsert file to Supabase storage
+    const { error: uploadError } = await supabase.storage
+      .from("files")
+      .upload(fileRecord.storage_path, contentBuffer, {
+        contentType,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      return res.status(500).json({
+        message: "Failed to update storage file content",
+        error: uploadError.message,
+      });
+    }
+
+    // Update file_size and created_at timestamp in DB
+    const updateDbResult = await pool.query(
+      `UPDATE files
+       SET file_size = $1, created_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [contentBuffer.length, id]
+    );
+
+    res.json({
+      message: "File content updated successfully",
+      file: updateDbResult.rows[0],
+    });
+  } catch (error) {
+    console.error("Update File Content Error:", error);
     res.status(500).json({
       message: "Server error",
       error: error.message,
@@ -441,4 +643,5 @@ module.exports = {
   searchFiles,
   toggleStarFile,
   deleteFilePermanent,
+  updateFileContent,
 };

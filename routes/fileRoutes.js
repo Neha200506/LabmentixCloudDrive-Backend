@@ -13,6 +13,7 @@ const {
   searchFiles,
   toggleStarFile,
   deleteFilePermanent,
+  updateFileContent,
 } = require("../controllers/fileController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -60,6 +61,13 @@ router.get(
   "/:id/url",
   authMiddleware,
   getFileUrl
+);
+
+// Update file content
+router.put(
+  "/:id/content",
+  authMiddleware,
+  updateFileContent
 );
 
 // Rename file
