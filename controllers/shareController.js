@@ -2,6 +2,7 @@ const pool = require("../database/db");
 const supabase = require("../config/supabase");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const { getBackendBaseUrl } = require("../utils/network");
 
 // Create nodemailer transporter configured through env variables
 const mailTransporter = nodemailer.createTransport({
@@ -115,7 +116,7 @@ const createShare = async (req, res) => {
       [file_id, ownerId, shareToken, role || "view"]
     );
 
-    const backendBaseUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 8080}`;
+    const backendBaseUrl = getBackendBaseUrl();
 
     res.status(201).json({
       message: "Share link created successfully",
@@ -308,7 +309,7 @@ const shareFileWithUser = async (req, res) => {
     );
 
     // Formulate the clickable share URL
-    const backendBaseUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 8080}`;
+    const backendBaseUrl = getBackendBaseUrl();
     const shareUrl = `${backendBaseUrl}/api/share/${shareToken}`;
 
     // Send email notification

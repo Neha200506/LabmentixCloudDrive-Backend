@@ -55,7 +55,8 @@ app.get("/api/profile", authMiddleware, (req, res) => {
   });
 });
 
-// Test database connection only when not running tests
+const { getLanIp } = require("./utils/network");
+
 if (process.env.NODE_ENV !== "test") {
   pool
     .query("SELECT NOW()")
@@ -65,7 +66,8 @@ if (process.env.NODE_ENV !== "test") {
     );
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT} (LAN: http://192.168.0.101:${PORT})`);
+    const lanIp = getLanIp();
+    console.log(`Server running on http://0.0.0.0:${PORT} (LAN: http://${lanIp}:${PORT})`);
   });
 }
 
