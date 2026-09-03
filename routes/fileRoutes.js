@@ -14,6 +14,10 @@ const {
   toggleStarFile,
   deleteFilePermanent,
   updateFileContent,
+  getPdfText,
+  getFileVersions,
+  getFileVersionUrl,
+  restoreFileVersion,
 } = require("../controllers/fileController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -56,11 +60,39 @@ router.put(
   restoreFile
 );
 
+// Get all historical versions for a file
+router.get(
+  "/:id/versions",
+  authMiddleware,
+  getFileVersions
+);
+
+// Get download URL for a specific historical version
+router.get(
+  "/:id/versions/:version_id/url",
+  authMiddleware,
+  getFileVersionUrl
+);
+
+// Restore a historical version as active file
+router.post(
+  "/:id/versions/:version_id/restore",
+  authMiddleware,
+  restoreFileVersion
+);
+
 // Get download URL
 router.get(
   "/:id/url",
   authMiddleware,
   getFileUrl
+);
+
+// Get extracted PDF text
+router.get(
+  "/:id/pdf-text",
+  authMiddleware,
+  getPdfText
 );
 
 // Update file content

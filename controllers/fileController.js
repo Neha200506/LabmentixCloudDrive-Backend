@@ -100,7 +100,7 @@ const getFiles = async (req, res) => {
         LEFT JOIN users u_me ON u_me.id = $1
         LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u_me.email) || ':%'
         WHERE (f.user_id = $1 OR p.shared_with = $1 OR fs.id IS NOT NULL) AND f.deleted_at IS NULL`;
-      
+
       queryText = `
         SELECT f.id, f.user_id, f.folder_id, f.file_name, f.file_size, f.file_type, f.storage_path, f.created_at, f.deleted_at, f.is_starred,
                u.full_name AS owner_name,
@@ -113,7 +113,7 @@ const getFiles = async (req, res) => {
         LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u_me.email) || ':%'
         WHERE (f.user_id = $1 OR p.shared_with = $1 OR fs.id IS NOT NULL) AND f.deleted_at IS NULL
         GROUP BY f.id, f.user_id, f.folder_id, f.file_name, f.file_size, f.file_type, f.storage_path, f.created_at, f.deleted_at, f.is_starred, u.full_name, p.permission_type, fs.role`;
-        
+
       countParams = [userId];
       queryParams = [userId, limit, offset];
     }
@@ -506,6 +506,75 @@ const deleteFilePermanent = async (req, res) => {
   }
 };
 
+// Get extracted text/HTML from PDF
+const getPdfText = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const checkAccess = await pool.query(
+      `SELECT f.*, 
+              CASE WHEN f.user_id = $2 THEN 'owner' ELSE COALESCE(p.permission_type, fs.role) END AS perm
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       LEFT JOIN users u ON u.id = $2
+       LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.share_token LIKE 'email:' || LOWER(u.email) || ':%'
+       WHERE f.id = $1 AND f.deleted_at IS NULL`,
+      [id, userId]
+    );
+
+    if (checkAccess.rows.length === 0) {
+      return res.status(404).json({
+        message: "File not found or access denied",
+      });
+    }
+
+    const fileRecord = checkAccess.rows[0];
+
+    const { data, error } = await supabase.storage
+      .from("files")
+      .download(fileRecord.storage_path);
+
+    if (error || !data) {
+      return res.status(500).json({
+        message: "Could not download PDF file for text extraction",
+        error: error ? error.message : "No data",
+      });
+    }
+
+    const pdfBuffer = Buffer.from(await data.arrayBuffer());
+    const pdfParse = require("pdf-parse");
+    const parsed = await pdfParse(pdfBuffer);
+    let rawText = (parsed && parsed.text) ? parsed.text : "";
+    rawText = rawText.replace(/\r\n/g, "\n");
+
+    const paragraphs = rawText
+      .split(/\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map(
+        (p) =>
+          `<p>${p
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")}</p>`
+      )
+      .join("");
+
+    res.json({
+      message: "PDF text extracted successfully",
+      text: rawText,
+      html: paragraphs || "<p>PDF document content ready for editing...</p>",
+    });
+  } catch (error) {
+    console.error("Get PDF Text Error:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+};
+
 // Update file content
 const updateFileContent = async (req, res) => {
   try {
@@ -551,40 +620,123 @@ const updateFileContent = async (req, res) => {
 
     let contentBuffer;
     let contentType = fileRecord.file_type || 'text/plain';
+    const isDocx = (fileRecord.file_name && (fileRecord.file_name.toLowerCase().endsWith('.docx') || fileRecord.file_name.toLowerCase().endsWith('.doc'))) || fileRecord.file_type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || fileRecord.file_type === 'application/msword';
+    const isPdf = (fileRecord.file_name && fileRecord.file_name.toLowerCase().endsWith('.pdf')) || fileRecord.file_type === 'application/pdf';
 
-    if ((fileRecord.file_name && fileRecord.file_name.toLowerCase().endsWith('.pdf')) || fileRecord.file_type === 'application/pdf') {
+    if (isDocx) {
+      contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      try {
+        const htmlToDocx = require("html-to-docx");
+        const fullHtml = content.includes('<html')
+          ? content
+          : `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>${content}</body></html>`;
+
+        const docxBuffer = await htmlToDocx(fullHtml, null, {
+          table: { row: { cantSplit: true } },
+          footer: true,
+          pageNumber: true,
+        });
+        contentBuffer = Buffer.from(docxBuffer);
+      } catch (docxErr) {
+        console.error("HTML to DOCX compilation error, falling back to raw buffer:", docxErr);
+        contentBuffer = Buffer.from(content, 'utf-8');
+      }
+    } else if (isPdf) {
       contentType = 'application/pdf';
       try {
         const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
-        let pdfDoc;
-
-        const { data: existingData, error: downloadError } = await supabase.storage
-          .from("files")
-          .download(fileRecord.storage_path);
-
-        if (!downloadError && existingData) {
-          const existingBuffer = Buffer.from(await existingData.arrayBuffer());
-          pdfDoc = await PDFDocument.load(existingBuffer);
-        } else {
-          pdfDoc = await PDFDocument.create();
-        }
-
+        const pdfDoc = await PDFDocument.create();
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-        const lines = (content || '').split('\n');
+        const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-        let page = pdfDoc.addPage([600, 800]);
-        page.drawText("--- Document Edit / Notes ---", { x: 50, y: 750, size: 12, font, color: rgb(0.2, 0.4, 0.8) });
-        let y = 720;
+        const cleanText = (content || '')
+          .replace(/<h[1-6][^>]*>(.*?)<\/h[1-6]>/gi, '\n# $1\n')
+          .replace(/<li[^>]*>(.*?)<\/li>/gi, '\n• $1')
+          .replace(/<p[^>]*>/gi, '\n')
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&amp;/g, '&');
 
-        for (const line of lines) {
-          if (y < 40) {
-            page = pdfDoc.addPage([600, 800]);
-            y = 750;
+        const lines = cleanText.split('\n');
+        let page = pdfDoc.addPage([595.28, 841.89]); // A4
+        const margin = 50;
+        const width = 595.28 - margin * 2;
+        let y = 841.89 - margin;
+
+        page.drawText(fileRecord.file_name || "Document", {
+          x: margin,
+          y,
+          size: 16,
+          font: boldFont,
+          color: rgb(0.1, 0.1, 0.2),
+        });
+        y -= 25;
+        page.drawLine({
+          start: { x: margin, y },
+          end: { x: 595.28 - margin, y },
+          thickness: 1,
+          color: rgb(0.8, 0.8, 0.8),
+        });
+        y -= 20;
+
+        for (let line of lines) {
+          line = line.trim();
+          if (!line) {
+            y -= 10;
+            continue;
           }
-          const safeLine = line.replace(/[^\x00-\x7F]/g, '');
-          page.drawText(safeLine || ' ', { x: 50, y, size: 11, font, color: rgb(0.1, 0.1, 0.1) });
-          y -= 16;
+
+          const isHeader = line.startsWith('# ');
+          if (isHeader) line = line.substring(2);
+
+          const lineFont = isHeader ? boldFont : font;
+          const fontSize = isHeader ? 14 : 11;
+          const lineHeight = fontSize + 6;
+
+          const words = line.split(' ');
+          let currentLine = '';
+
+          for (const word of words) {
+            const testLine = currentLine ? `${currentLine} ${word}` : word;
+            const testWidth = lineFont.widthOfTextAtSize(testLine, fontSize);
+            if (testWidth > width && currentLine) {
+              if (y < margin + 20) {
+                page = pdfDoc.addPage([595.28, 841.89]);
+                y = 841.89 - margin;
+              }
+              page.drawText(currentLine, {
+                x: margin,
+                y,
+                size: fontSize,
+                font: lineFont,
+                color: isHeader ? rgb(0.1, 0.2, 0.6) : rgb(0.1, 0.1, 0.1),
+              });
+              y -= lineHeight;
+              currentLine = word;
+            } else {
+              currentLine = testLine;
+            }
+          }
+
+          if (currentLine) {
+            if (y < margin + 20) {
+              page = pdfDoc.addPage([595.28, 841.89]);
+              y = 841.89 - margin;
+            }
+            page.drawText(currentLine, {
+              x: margin,
+              y,
+              size: fontSize,
+              font: lineFont,
+              color: isHeader ? rgb(0.1, 0.2, 0.6) : rgb(0.1, 0.1, 0.1),
+            });
+            y -= lineHeight;
+          }
         }
+
         const pdfBytes = await pdfDoc.save();
         contentBuffer = Buffer.from(pdfBytes);
       } catch (pdfErr) {
@@ -593,6 +745,55 @@ const updateFileContent = async (req, res) => {
       }
     } else {
       contentBuffer = Buffer.from(content, 'utf-8');
+    }
+
+    // Preserving current active file as a historical version before overwriting
+    try {
+      const { data: existingFileData, error: existingFileErr } = await supabase.storage
+        .from("files")
+        .download(fileRecord.storage_path);
+
+      if (!existingFileErr && existingFileData) {
+        const existingBuffer = Buffer.from(await existingFileData.arrayBuffer());
+
+        const versionCountRes = await pool.query(
+          `SELECT COALESCE(MAX(version_number), 0) AS max_version
+           FROM file_versions
+           WHERE file_id = $1`,
+          [id]
+        );
+        const nextVersionNumber = Number(versionCountRes.rows[0].max_version) + 1;
+
+        const ext = (fileRecord.file_name && fileRecord.file_name.includes('.'))
+          ? fileRecord.file_name.split('.').pop()
+          : 'bin';
+        const timestamp = Date.now();
+        const versionStoragePath = `versions/${id}/v${nextVersionNumber}_${timestamp}.${ext}`;
+
+        const { error: versionUploadErr } = await supabase.storage
+          .from("files")
+          .upload(versionStoragePath, existingBuffer, {
+            contentType: fileRecord.file_type || 'application/octet-stream',
+            upsert: true,
+          });
+
+        if (!versionUploadErr) {
+          await pool.query(
+            `INSERT INTO file_versions
+             (file_id, version_number, storage_path, file_size, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())`,
+            [
+              id,
+              nextVersionNumber,
+              versionStoragePath,
+              existingBuffer.length,
+              userId
+            ]
+          );
+        }
+      }
+    } catch (versionErr) {
+      console.error("Preserving file version warning:", versionErr);
     }
 
     // Upload/upsert file to Supabase storage
@@ -632,6 +833,220 @@ const updateFileContent = async (req, res) => {
   }
 };
 
+// Get all historical versions for a file
+const getFileVersions = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const fileCheck = await pool.query(
+      `SELECT f.id
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND (f.user_id = $2 OR p.shared_with = $2)`,
+      [id, userId]
+    );
+
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const versionsResult = await pool.query(
+      `SELECT id, version_number, file_size, created_by, created_at
+       FROM file_versions
+       WHERE file_id = $1
+       ORDER BY version_number DESC`,
+      [id]
+    );
+
+    res.json({
+      message: "File versions fetched successfully",
+      versions: versionsResult.rows,
+    });
+  } catch (error) {
+    console.error("Get File Versions Error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Get download URL for a specific historical version
+const getFileVersionUrl = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id, version_id } = req.params;
+
+    const fileCheck = await pool.query(
+      `SELECT f.id
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND (f.user_id = $2 OR p.shared_with = $2)`,
+      [id, userId]
+    );
+
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const versionResult = await pool.query(
+      `SELECT * FROM file_versions WHERE id = $1 AND file_id = $2`,
+      [version_id, id]
+    );
+
+    if (versionResult.rows.length === 0) {
+      return res.status(404).json({ message: "Version not found for this file" });
+    }
+
+    const version = versionResult.rows[0];
+
+    const { data, error } = await supabase.storage
+      .from("files")
+      .createSignedUrl(version.storage_path, 3600);
+
+    if (error) {
+      return res.status(500).json({
+        message: "Could not create version URL",
+        error: error.message,
+      });
+    }
+
+    res.json({
+      message: "Version URL created successfully",
+      url: data.signedUrl || data.url,
+    });
+  } catch (error) {
+    console.error("Get Version URL Error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Restore a historical version as the active file
+const restoreFileVersion = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id, version_id } = req.params;
+
+    const fileCheck = await pool.query(
+      `SELECT f.*
+       FROM files f
+       LEFT JOIN permissions p ON f.id = p.file_id AND p.shared_with = $2
+       WHERE f.id = $1 AND (f.user_id = $2 OR p.shared_with = $2)`,
+      [id, userId]
+    );
+
+    if (fileCheck.rows.length === 0) {
+      return res.status(404).json({ message: "File not found" });
+    }
+
+    const file = fileCheck.rows[0];
+
+    const versionResult = await pool.query(
+      `SELECT * FROM file_versions WHERE id = $1 AND file_id = $2`,
+      [version_id, id]
+    );
+
+    if (versionResult.rows.length === 0) {
+      return res.status(404).json({ message: "Version not found for this file" });
+    }
+
+    const version = versionResult.rows[0];
+
+    // Download the historical version from Supabase Storage
+    const { data: versionData, error: dlError } = await supabase.storage
+      .from("files")
+      .download(version.storage_path);
+
+    if (dlError || !versionData) {
+      return res.status(500).json({
+        message: "Failed to download historical version content",
+        error: dlError ? dlError.message : "Version content missing",
+      });
+    }
+
+    const versionBuffer = Buffer.from(await versionData.arrayBuffer());
+
+    // Before overwriting current active file, preserve current active file as a historical version
+    try {
+      const { data: currentFileData, error: currentFileErr } = await supabase.storage
+        .from("files")
+        .download(file.storage_path);
+
+      if (!currentFileErr && currentFileData) {
+        const currentBuffer = Buffer.from(await currentFileData.arrayBuffer());
+
+        const versionCountRes = await pool.query(
+          `SELECT COALESCE(MAX(version_number), 0) AS max_version
+           FROM file_versions
+           WHERE file_id = $1`,
+          [id]
+        );
+        const nextVersionNumber = Number(versionCountRes.rows[0].max_version) + 1;
+
+        const ext = (file.file_name && file.file_name.includes('.'))
+          ? file.file_name.split('.').pop()
+          : 'bin';
+        const timestamp = Date.now();
+        const newVersionPath = `versions/${id}/v${nextVersionNumber}_${timestamp}.${ext}`;
+
+        const { error: newVersionUploadErr } = await supabase.storage
+          .from("files")
+          .upload(newVersionPath, currentBuffer, {
+            contentType: file.file_type || 'application/octet-stream',
+            upsert: true,
+          });
+
+        if (!newVersionUploadErr) {
+          await pool.query(
+            `INSERT INTO file_versions
+             (file_id, version_number, storage_path, file_size, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())`,
+            [
+              id,
+              nextVersionNumber,
+              newVersionPath,
+              currentBuffer.length,
+              userId
+            ]
+          );
+        }
+      }
+    } catch (snapshotErr) {
+      console.error("Preserving version snapshot warning on restore:", snapshotErr);
+    }
+
+    // Upload historical version buffer to active storage_path
+    const { error: uploadError } = await supabase.storage
+      .from("files")
+      .upload(file.storage_path, versionBuffer, {
+        contentType: file.file_type || "application/octet-stream",
+        upsert: true,
+      });
+
+    if (uploadError) {
+      return res.status(500).json({
+        message: "Failed to upload restored version to active file path",
+        error: uploadError.message,
+      });
+    }
+
+    // Update active file size and created_at in PostgreSQL DB
+    const updateResult = await pool.query(
+      `UPDATE files
+       SET file_size = $1, created_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [versionBuffer.length, id]
+    );
+
+    res.json({
+      message: "File restored to selected version successfully",
+      file: updateResult.rows[0],
+    });
+  } catch (error) {
+    console.error("Restore File Version Error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
 module.exports = {
   uploadFile,
   getFiles,
@@ -644,4 +1059,8 @@ module.exports = {
   toggleStarFile,
   deleteFilePermanent,
   updateFileContent,
+  getPdfText,
+  getFileVersions,
+  getFileVersionUrl,
+  restoreFileVersion,
 };
