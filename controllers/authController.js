@@ -195,5 +195,20 @@ const resetPassword = async (req, res) => {
   }
 };
 
-module.exports = { signup, login, logout, forgotPassword, resetPassword };
+const getUsers = async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, full_name, email FROM users WHERE email NOT LIKE '%@example.com' ORDER BY full_name ASC"
+    );
+
+    res.json({
+      users: result.rows,
+    });
+  } catch (error) {
+    console.error("Get Users Error:", error);
+    res.status(500).json({ message: "Failed to fetch users" });
+  }
+};
+
+module.exports = { signup, login, logout, forgotPassword, resetPassword, getUsers };
 

@@ -104,6 +104,7 @@ const getFiles = async (req, res) => {
       queryText = `
         SELECT f.id, f.user_id, f.folder_id, f.file_name, f.file_size, f.file_type, f.storage_path, f.created_at, f.deleted_at, f.is_starred,
                u.full_name AS owner_name,
+               f.user_id AS owner_id,
                CASE WHEN f.user_id = $1 THEN false ELSE true END AS is_shared,
                COALESCE(p.permission_type, fs.role) AS shared_permission
         FROM files f
